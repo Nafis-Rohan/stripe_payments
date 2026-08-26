@@ -36,3 +36,7 @@ build/
 .env
 .env.*
 !.env.example
+
+### Markdown notes (kept local only) ###
+*.md
+!README.md
