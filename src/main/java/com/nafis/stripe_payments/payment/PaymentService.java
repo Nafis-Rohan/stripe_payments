@@ -3,6 +3,8 @@ package com.nafis.stripe_payments.payment;
 import com.nafis.stripe_payments.common.StripeLogging;
 import com.nafis.stripe_payments.payment.dto.PaymentRequest;
 import com.nafis.stripe_payments.payment.dto.PaymentResult;
+import com.nafis.stripe_payments.payment.event.PaymentFailedEvent;
+import com.nafis.stripe_payments.payment.event.PaymentSucceededEvent;
 import com.stripe.StripeClient;
 import com.stripe.exception.StripeException;
 import com.stripe.model.PaymentIntent;
@@ -10,6 +12,7 @@ import com.stripe.net.RequestOptions;
 import com.stripe.param.PaymentIntentCreateParams;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.support.TransactionTemplate;
 
@@ -22,6 +25,7 @@ public class PaymentService {
     private final PaymentRepository paymentRepository;
     private final StripeClient stripeClient;
     private final TransactionTemplate txTemplate; // ManualTransaction, Spring Boot auto-configures this bean
+    private final ApplicationEventPublisher events;
 
     public PaymentResult createPaymentIntent(PaymentRequest request)
             throws StripeException {
@@ -101,27 +105,12 @@ public class PaymentService {
 
     }
 
-    /**
-     * What the cardholder sees on their bank statement, appended to the account's
-     * static prefix as "PREFIX* SUFFIX". Stripe rules: the whole line (prefix +
-     * suffix) is capped at 22 chars, and none of  < > \ ' " *  are allowed — so
-     * strip anything that isn't a letter, digit or space and keep it short.
-     * Putting the order reference here stops a customer reporting the charge as
-     * fraud because they don't recognise it.
-     */
     private String statementDescriptorSuffix(PaymentRequest request) {
         String raw = request.referenceType().name() + " " + request.referenceId(); // e.g. "ORDER 42"
         String cleaned = raw.replaceAll("[^A-Za-z0-9 ]", "").trim();
         return cleaned.length() > 10 ? cleaned.substring(0, 10) : cleaned;
     }
 
-    /**
-     * Pre-webhook safety net: pull a PaymentIntent's current state straight from
-     * Stripe and converge our row to it. Until Phase 4 wires webhooks, this is
-     * the only way our DB finds out a payment succeeded or failed after
-     * createPaymentIntent already returned. Stays useful afterwards as a manual
-     * "what does Stripe actually think?" check during an incident.
-     */
     public PaymentResult syncFromStripe(Long paymentId) throws StripeException {
         Payment payment = paymentRepository.findById(paymentId)
                 .orElseThrow(() -> new IllegalArgumentException("No payment with id " + paymentId));
@@ -131,18 +120,16 @@ public class PaymentService {
                     "Payment " + paymentId + " has no PaymentIntent yet — nothing to sync");
         }
         // No transaction around the network call — same reasoning as createPaymentIntent.
-                PaymentIntent intent = stripeClient.paymentIntents()
+        PaymentIntent intent = stripeClient.paymentIntents()
                 .retrieve(payment.getStripePaymentIntentId());
         StripeLogging.logSuccess("paymentIntent.retrieve", intent);
 
         PaymentStatus stripeStatus = mapStatus(intent.getStatus());
+        PaymentStatus before = payment.getStatus(); // new code: remember status before, to detect a real transition
 
         Payment updated = txTemplate.execute(status -> {
-            Payment p =
-                    paymentRepository.findById(paymentId).orElseThrow();
-            // State-convergent, and never walk a row backwards out of a terminal
-            // status (plan.md §5 / §8). A real Payment.transitionTo() guard comes
-            // later; this inline check is enough for now.
+            Payment p = paymentRepository.findById(paymentId).orElseThrow();
+
             if (isTerminal(p.getStatus()) && p.getStatus() !=
                     stripeStatus) {
                 log.warn("Refusing to move payment {} from terminal {} to {} (Stripe: {})",
@@ -153,6 +140,37 @@ public class PaymentService {
             return paymentRepository.save(p);
         });
 
+        // new code: publish domain-agnostic events after the row is committed.
+        //Event-Driven Architecture (Decoupling)
+        //If the payment status actually changed, tell the rest of your application what happened.
+        //ApplicationEventPublisher is a Spring tool for publishing events inside your application.
+//        PaymentService
+//                |
+//                | "Payment succeeded!"
+//                ↓
+//        ApplicationEventPublisher
+//                |
+//                ├── Order listener
+//                ├── Email listener
+//                ├── Notification listener
+//                └── Audit listener
+        //The PaymentService doesn't need to directly call all those services.
+        // txTemplate.execute has returned, so the row is committed — safe to announce.
+        // Only fire on a real transition, so a second sync stays quiet (idempotent).
+        if (before != updated.getStatus()) {
+            if (updated.getStatus() == PaymentStatus.SUCCEEDED) {
+                events.publishEvent(new PaymentSucceededEvent(
+                        updated.getId(), updated.getReferenceType(), updated.getReferenceId(),
+                        updated.getUserId(), updated.getAmount(), updated.getCurrency()));
+            } else if (updated.getStatus() == PaymentStatus.REQUIRES_PAYMENT_METHOD
+                    && intent.getLastPaymentError() != null) {
+                var err = intent.getLastPaymentError();
+                events.publishEvent(new PaymentFailedEvent(
+                        updated.getId(), updated.getReferenceType(), updated.getReferenceId(),
+                        updated.getUserId(), err.getCode(), err.getMessage()));
+            }
+        }
+
         return new PaymentResult(updated.getId(), updated.getStripePaymentIntentId(),
                 intent.getClientSecret(), updated.getStatus());
 
@@ -160,6 +178,11 @@ public class PaymentService {
 
     private boolean isTerminal(PaymentStatus status) {
         return status == PaymentStatus.SUCCEEDED || status == PaymentStatus.CANCELED;
+    }
+
+    public Payment getPayment(Long id) {
+        return paymentRepository.findById(id)
+                .orElseThrow(() -> new IllegalArgumentException("No payment with id " + id));
     }
 
 }
