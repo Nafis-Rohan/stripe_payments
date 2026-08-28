@@ -3,8 +3,10 @@ package com.nafis.stripe_payments.payment.dto;
 import com.nafis.stripe_payments.payment.PaymentReferenceType;
 
 public record PaymentRequest( Long userId, String stripeCustomerId, long amount, String currency,
-                                                        PaymentReferenceType referenceType,
-                                                        Long referenceId) {
+                              PaymentReferenceType referenceType,
+                              Long referenceId,
+                              String receiptEmail) {
+
     //Compact Constructor - It runs automatically the exact moment a new PaymentRequest is created
     public PaymentRequest {
         if (userId == null) throw new IllegalArgumentException("userId is required");
