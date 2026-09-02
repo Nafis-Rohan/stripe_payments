@@ -27,8 +27,7 @@ public class PaymentController {
      Order.
      */
     @PostMapping
-    public ResponseEntity<PaymentResult> create(@RequestBody
-                                                PaymentRequest request)
+    public ResponseEntity<PaymentResult> create(@RequestBody PaymentRequest request)
             throws StripeException {
         return ResponseEntity.status(HttpStatus.CREATED)
                 .body(paymentService.createPaymentIntent(request));

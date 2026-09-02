@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Stripe Playground — Pay</title>
+    <script src="https://js.stripe.com/v3/"></script>
+    <style>
+        body { font-family: system-ui, sans-serif; max-width: 480px;
+            margin: 40px auto; padding: 0 16px; }
+        label { display: block; margin: 8px 0 2px; font-size: 13px; color:
+                #555; }
+        input { width: 100%; padding: 6px 8px; box-sizing: border-box; }
+        button { margin-top: 12px; padding: 8px 16px; cursor: pointer; }
+        #payment-element { margin-top: 16px; }
+        #result { margin-top: 16px; padding: 12px; border-radius: 6px;
+            white-space: pre-wrap;
+            font-family: monospace; font-size: 13px; }
+        .ok { background: #e6ffed; } .err { background: #ffeef0; }
+        fieldset { border: 1px solid #ddd; border-radius: 6px; }
+    </style>
+</head>
+<body>
+<h1>Pay</h1>
+
+<fieldset id="step1">
+    <legend>1. Create PaymentIntent</legend>
+    <label>userId</label><input id="userId" value="1">
+    <label>stripeCustomerId</label><input id="stripeCustomerId"
+                                          placeholder="cus_... (GET /api/users/1)">
+    <label>amount (minor units)</label><input id="amount" value="1999">
+    <label>currency</label><input id="currency" value="usd">
+    <label>referenceId (order id)</label><input id="referenceId"
+                                                value="1">
+    <label>receiptEmail</label><input id="receiptEmail"
+                                      value="buyer@test.com">
+    <button id="createBtn">Create</button>
+</fieldset>
+
+<fieldset id="step2" disabled>
+    <legend>2. Pay</legend>
+    <div id="payment-element"></div>
+    <button id="payBtn">Pay</button>
+</fieldset>
+
+<div id="result"></div>
+
+<script>
+    let stripe, elements, paymentId;
+    const $ = id => document.getElementById(id);
+    const show = (msg, ok) => { const r = $('result'); r.textContent =
+        msg; r.className = ok ? 'ok' : 'err'; };
+
+    (async () => {
+        const { publishableKey } = await (await
+            fetch('/api/config')).json();
+        stripe = Stripe(publishableKey);
+    })();
+
+    $('createBtn').addEventListener('click', async () => {
+        $('createBtn').disabled = true;
+        try {
+            const res = await fetch('/api/payments', {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({
+                    userId: Number($('userId').value),
+                    stripeCustomerId: $('stripeCustomerId').value,
+                    amount: Number($('amount').value),
+                    currency: $('currency').value,
+                    referenceType: 'ORDER',
+                    referenceId: Number($('referenceId').value),
+                    receiptEmail: $('receiptEmail').value || null
+                })
+            });
+            const body = await res.json();
+            if (!res.ok) { show(JSON.stringify(body, null, 2), false);
+                $('createBtn').disabled = false; return; }
+            paymentId = body.paymentId;
+            elements = stripe.elements({ clientSecret: body.clientSecret });
+            elements.create('payment').mount('#payment-element');
+            $('step2').disabled = false;
+            show('PaymentIntent created: paymentId=' + paymentId + ' status='
+                + body.status, true);
+        } catch (e) {
+            show(String(e), false);
+            $('createBtn').disabled = false;
+        }
+    });
+
+    $('payBtn').addEventListener('click', async () => {
+        $('payBtn').disabled = true;
+        const { error } = await stripe.confirmPayment({
+            elements,
+            confirmParams: { return_url: window.location.href },
+            redirect: 'if_required'      // run the 3DS challenge inline; only navigate away if the method demands it
+        });
+
+        if (error) {
+            show('confirmPayment error: ' + error.message, false);
+            $('payBtn').disabled = false;
+            return;
+        }
+
+        // The client says it's done, but the webhook is the real source of truth (plan.md §10).
+        // Until Phase 4, ask our backend to sync the row from Stripe and report the true status.
+            const res = await fetch('/api/payments/' + paymentId + '/sync', {
+            method: 'POST' });
+        const body = await res.json();
+        show('After sync: status=' + body.status, res.ok && body.status ===
+            'SUCCEEDED');
+    });
+</script>
+</body>
+</html>
